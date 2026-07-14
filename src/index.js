@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, ActivityType, EmbedBuilder, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, ActivityType, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
@@ -23,8 +23,10 @@ export let isBotReady = false;
 export let botUser = null;
 export let botError = null;
 
-// File path for saving the last checked Instagram post ID
+// File paths
 const LAST_POST_FILE = path.join(process.cwd(), 'last_post_id.txt');
+const CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
+const CONFIG_PATH = path.join(process.cwd(), 'config.json');
 
 // Configs
 export let DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
@@ -33,8 +35,6 @@ export let INSTAGRAM_USERNAME = process.env.INSTAGRAM_USERNAME || 'cristiano';
 export let API_URL = process.env.API_URL || 'https://instagram-bulk-profile-scraps.p.rapidapi.com/v1.2/posts';
 export let API_KEY = process.env.API_KEY || '';
 export let BOT_PREFIX = process.env.BOT_PREFIX || '!';
-
-const CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
 
 // Helper to load dynamic config if it exists
 function loadConfig() {
@@ -50,6 +50,17 @@ function loadConfig() {
       botLog('Loaded saved configurations from bot_config.json');
     } catch (err) {
       botLog(`Failed to load bot_config.json: ${err.message}`);
+    }
+  }
+
+  if (fs.existsSync(CONFIG_PATH)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+      if (data.username !== undefined) INSTAGRAM_USERNAME = data.username;
+      if (data.channel !== undefined) TARGET_CHANNEL_ID = data.channel;
+      botLog('Loaded dynamic settings from config.json');
+    } catch (err) {
+      botLog(`Failed to load config.json: ${err.message}`);
     }
   }
 }
@@ -77,6 +88,17 @@ export function updateBotConfig(newConfig) {
     botLog('Successfully saved updated configuration to bot_config.json');
   } catch (err) {
     botLog(`Failed to write bot_config.json: ${err.message}`);
+  }
+
+  // Also keep config.json in sync if updated from dashboard
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+      username: INSTAGRAM_USERNAME,
+      channel: TARGET_CHANNEL_ID
+    }, null, 2), 'utf8');
+    botLog('Successfully synchronized config.json with updated dashboard target settings');
+  } catch (err) {
+    botLog(`Failed to sync config.json: ${err.message}`);
   }
 
   // If client is logged in, update presence with new Instagram username
@@ -270,7 +292,7 @@ export async function checkInstagramPosts() {
           botLog('Bot is not logged into Discord; skipped sending message but recorded ID.');
         }
         if (!TARGET_CHANNEL_ID) {
-          botLog('TARGET_CHANNEL_ID is not configured in .env; skipped sending Discord message.');
+          botLog('TARGET_CHANNEL_ID is not configured; skipped sending Discord message.');
         }
       }
     } else {
@@ -297,7 +319,21 @@ async function registerSlashCommands(clientId) {
       .setDescription('Displays information about the bot and a list of available commands.'),
     new SlashCommandBuilder()
       .setName('status')
-      .setDescription('Check live parameters and status of the tracking agent.')
+      .setDescription('Check live parameters and status of the tracking agent.'),
+    new SlashCommandBuilder()
+      .setName('setup')
+      .setDescription('Set up the Instagram target username and Discord announcement channel.')
+      .addStringOption(option =>
+        option.setName('username')
+          .setDescription('The Instagram handle to track')
+          .setRequired(true)
+      )
+      .addChannelOption(option =>
+        option.setName('channel')
+          .setDescription('The channel to send the embeds to')
+          .setRequired(true)
+      )
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   ].map(command => command.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -360,10 +396,32 @@ function initDiscordClient(usePrivileged = true) {
     // Start the 15-minute polling loop if not already running
     if (!isPollingStarted) {
       isPollingStarted = true;
-      checkInstagramPosts();
-      setInterval(() => {
-        checkInstagramPosts();
-      }, 15 * 60 * 1000); // 15 minutes
+      
+      const pollIteration = () => {
+        if (!fs.existsSync(CONFIG_PATH)) {
+          console.log('[Bot] config.json does not exist yet. Polling skipped.');
+          return;
+        }
+        try {
+          const configData = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+          if (configData.username) {
+            INSTAGRAM_USERNAME = configData.username;
+          }
+          if (configData.channel) {
+            TARGET_CHANNEL_ID = configData.channel;
+          }
+          botLog(`Polling loop running dynamically with username: ${INSTAGRAM_USERNAME}, channel ID: ${TARGET_CHANNEL_ID}`);
+          checkInstagramPosts();
+        } catch (err) {
+          console.log(`[Bot] Error reading/parsing config.json in polling loop: ${err.message}`);
+        }
+      };
+
+      // Run immediately
+      pollIteration();
+
+      // Interval loop every 15 minutes
+      setInterval(pollIteration, 15 * 60 * 1000);
     }
   });
 
@@ -401,7 +459,7 @@ function initDiscordClient(usePrivileged = true) {
           .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME}** and announce new posts automatically.`)
           .addFields(
             { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})` },
-            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.` },
+            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.` },
             { name: '🎯 Automatic Features', value: `• **Mention Reply:** Tag me anytime to see my prefix.\n• **Instagram Polling:** Automatically queries Instagram every 15 minutes and publishes embeds for new content.` }
           )
           .setFooter({ text: 'Created with discord.js v14', iconURL: client.user.displayAvatarURL() })
@@ -451,7 +509,7 @@ function initDiscordClient(usePrivileged = true) {
           .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME}** and announce new posts automatically.`)
           .addFields(
             { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})` },
-            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.` },
+            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.` },
             { name: '🎯 Automatic Features', value: `• **Mention Reply:** Tag me anytime to see my prefix.\n• **Instagram Polling:** Automatically queries Instagram every 15 minutes and publishes embeds for new content.` }
           )
           .setFooter({ text: 'Created with discord.js v14', iconURL: client.user.displayAvatarURL() })
@@ -481,6 +539,44 @@ function initDiscordClient(usePrivileged = true) {
         await interaction.reply({ embeds: [statusEmbed] });
       } catch (err) {
         botLog(`Failed to respond to /status interaction: ${err.message}`);
+      }
+    }
+
+    if (commandName === 'setup') {
+      botLog(`User ${interaction.user.username} executed /setup slash command`);
+      try {
+        const username = interaction.options.getString('username', true);
+        const channel = interaction.options.getChannel('channel', true);
+
+        const configData = {
+          username: username,
+          channel: channel.id
+        };
+
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(configData, null, 2), 'utf8');
+        botLog(`Successfully saved new setup configuration to config.json: Target username: ${username}, Target Channel: ${channel.id}`);
+
+        // Update active in-memory variables dynamically
+        INSTAGRAM_USERNAME = username;
+        TARGET_CHANNEL_ID = channel.id;
+
+        // Update presence dynamically
+        if (client && isBotReady) {
+          const presenceString = `Watching @${INSTAGRAM_USERNAME}`;
+          client.user.setActivity(presenceString, { type: ActivityType.Watching });
+          botLog(`Presence updated to: "Watching @${INSTAGRAM_USERNAME}"`);
+        }
+
+        await interaction.reply({
+          content: `✅ **Setup completed successfully!**\n• **Instagram Handle:** @${username}\n• **Announcement Channel:** <#${channel.id}>`,
+          ephemeral: true
+        });
+      } catch (err) {
+        botLog(`Failed to execute /setup command: ${err.message}`);
+        await interaction.reply({
+          content: `❌ **Failed to complete setup:** ${err.message}`,
+          ephemeral: true
+        }).catch(() => {});
       }
     }
   });
