@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, ActivityType, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
+import { Client, GatewayIntentBits, ActivityType, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits, StringSelectMenuBuilder, ActionRowBuilder } from 'discord.js';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
@@ -25,6 +25,7 @@ export let botError = null;
 
 // File paths
 const LAST_POST_FILE = path.join(process.cwd(), 'last_post_id.txt');
+const LAST_POSTS_FILE = path.join(process.cwd(), 'last_posts.json');
 const CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
 const CONFIG_PATH = path.join(process.cwd(), 'config.json');
 
@@ -56,11 +57,31 @@ function loadConfig() {
   if (fs.existsSync(CONFIG_PATH)) {
     try {
       const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-      if (data.username !== undefined) INSTAGRAM_USERNAME = data.username;
-      if (data.channel !== undefined) TARGET_CHANNEL_ID = data.channel;
-      botLog('Loaded dynamic settings from config.json');
+      if (Array.isArray(data)) {
+        if (data.length > 0) {
+          INSTAGRAM_USERNAME = data[0].instagramUsername || data[0].username || '';
+          TARGET_CHANNEL_ID = data[0].channelId || data[0].channel || '';
+        }
+        botLog(`Loaded list of ${data.length} tracking targets from config.json`);
+      } else {
+        // Migrate old structure to array
+        const username = data.username || data.instagramUsername || 'cristiano';
+        const channel = data.channel || data.channelId || '';
+        const migrated = [{ instagramUsername: username, channelId: channel }];
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(migrated, null, 2), 'utf8');
+        INSTAGRAM_USERNAME = username;
+        TARGET_CHANNEL_ID = channel;
+        botLog('Migrated legacy config.json single object format to Array');
+      }
     } catch (err) {
       botLog(`Failed to load config.json: ${err.message}`);
+    }
+  } else {
+    try {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify([], null, 2), 'utf8');
+      botLog('Initialized default empty array in config.json');
+    } catch (err) {
+      botLog(`Failed to write empty config.json: ${err.message}`);
     }
   }
 }
@@ -92,10 +113,33 @@ export function updateBotConfig(newConfig) {
 
   // Also keep config.json in sync if updated from dashboard
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify({
-      username: INSTAGRAM_USERNAME,
-      channel: TARGET_CHANNEL_ID
-    }, null, 2), 'utf8');
+    let targets = [];
+    if (fs.existsSync(CONFIG_PATH)) {
+      try {
+        const fileContent = fs.readFileSync(CONFIG_PATH, 'utf8');
+        const parsed = JSON.parse(fileContent);
+        if (Array.isArray(parsed)) {
+          targets = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+          const username = parsed.username || parsed.instagramUsername;
+          const channel = parsed.channel || parsed.channelId;
+          if (username) {
+            targets.push({ instagramUsername: username, channelId: channel || '' });
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (INSTAGRAM_USERNAME) {
+      const existingIndex = targets.findIndex(t => t.instagramUsername.toLowerCase() === INSTAGRAM_USERNAME.toLowerCase());
+      if (existingIndex > -1) {
+        targets[existingIndex].channelId = TARGET_CHANNEL_ID;
+      } else {
+        targets.push({ instagramUsername: INSTAGRAM_USERNAME, channelId: TARGET_CHANNEL_ID });
+      }
+    }
+
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(targets, null, 2), 'utf8');
     botLog('Successfully synchronized config.json with updated dashboard target settings');
   } catch (err) {
     botLog(`Failed to sync config.json: ${err.message}`);
@@ -104,7 +148,7 @@ export function updateBotConfig(newConfig) {
   // If client is logged in, update presence with new Instagram username
   if (client && isBotReady) {
     try {
-      const presenceString = `Watching @${INSTAGRAM_USERNAME}`;
+      const presenceString = `Watching @${INSTAGRAM_USERNAME || 'multiple accounts'}`;
       client.user.setActivity(presenceString, { type: ActivityType.Watching });
       botLog(`Presence updated to: "Watching @${INSTAGRAM_USERNAME}"`);
     } catch (err) {
@@ -140,44 +184,71 @@ if (!fs.existsSync(LAST_POST_FILE)) {
   }
 }
 
-// Get the saved post ID
-function getSavedPostId() {
+// Initialize the Last Posts json cache if it doesn't exist
+if (!fs.existsSync(LAST_POSTS_FILE)) {
+  try {
+    fs.writeFileSync(LAST_POSTS_FILE, JSON.stringify({}), 'utf8');
+    botLog('Created local multi-post tracker file (last_posts.json)');
+  } catch (err) {
+    botLog(`Failed to create multi-post tracker file: ${err.message}`);
+  }
+}
+
+// Get the saved post ID for a user
+function getSavedPostId(username) {
+  try {
+    if (fs.existsSync(LAST_POSTS_FILE)) {
+      const cache = JSON.parse(fs.readFileSync(LAST_POSTS_FILE, 'utf8'));
+      if (cache[username.toLowerCase()]) {
+        return cache[username.toLowerCase()];
+      }
+    }
+  } catch (err) {
+    botLog(`Error reading saved post ID for @${username} from last_posts.json: ${err.message}`);
+  }
+  // Fallback to legacy single file
   try {
     if (fs.existsSync(LAST_POST_FILE)) {
       return fs.readFileSync(LAST_POST_FILE, 'utf8').trim();
     }
-  } catch (err) {
-    botLog(`Error reading saved post ID: ${err.message}`);
-  }
+  } catch (err) {}
   return '';
 }
 
-// Save the post ID
-function savePostId(id) {
+// Save the post ID for a user
+function savePostId(username, id) {
   try {
+    let cache = {};
+    if (fs.existsSync(LAST_POSTS_FILE)) {
+      cache = JSON.parse(fs.readFileSync(LAST_POSTS_FILE, 'utf8'));
+    }
+    cache[username.toLowerCase()] = id;
+    fs.writeFileSync(LAST_POSTS_FILE, JSON.stringify(cache, null, 2), 'utf8');
+    botLog(`Saved new post ID for @${username} to local last_posts.json: ${id}`);
+
+    // Also write to legacy single file for backward compatibility
     fs.writeFileSync(LAST_POST_FILE, id, 'utf8');
-    botLog(`Saved new post ID to local file: ${id}`);
   } catch (err) {
-    botLog(`Error saving post ID: ${err.message}`);
+    botLog(`Error saving post ID for @${username}: ${err.message}`);
   }
 }
 
 // Helper to extract post data robustly from any API response format
-export function parseInstagramResponse(data) {
+export function parseInstagramResponse(data, username) {
   if (!data) return null;
 
   // 1. Direct array of posts
   if (Array.isArray(data) && data.length > 0) {
-    return parseSinglePost(data[0]);
+    return parseSinglePost(data[0], username);
   }
 
   // 2. Wrap inside a data/items property
   if (data.data) {
     if (Array.isArray(data.data) && data.data.length > 0) {
-      return parseSinglePost(data.data[0]);
+      return parseSinglePost(data.data[0], username);
     }
     if (data.data.items && Array.isArray(data.data.items) && data.data.items.length > 0) {
-      return parseSinglePost(data.data.items[0]);
+      return parseSinglePost(data.data.items[0], username);
     }
     // Deep GraphQL-like structures
     try {
@@ -197,25 +268,29 @@ export function parseInstagramResponse(data) {
 
   // 3. Simple single post object
   if (data.id || data.shortcode || data.code) {
-    return parseSinglePost(data);
+    return parseSinglePost(data, username);
   }
 
   return null;
 }
 
-function parseSinglePost(post) {
+function parseSinglePost(post, username) {
   const shortcode = post.shortcode || post.code || post.id || '';
   const id = post.id || shortcode;
   const caption = post.caption || post.text || post.title || 'New Instagram Post!';
-  const link = post.link || post.url || (shortcode ? `https://www.instagram.com/p/${shortcode}/` : `https://www.instagram.com/@${INSTAGRAM_USERNAME}`);
+  const link = post.link || post.url || (shortcode ? `https://www.instagram.com/p/${shortcode}/` : `https://www.instagram.com/@${username || INSTAGRAM_USERNAME}`);
   const mediaUrl = post.display_url || post.image || post.media_url || post.thumbnail || post.thumbnail_url || '';
 
   return { id, shortcode, caption, link, mediaUrl };
 }
 
 // The core Instagram Polling / Check Function
-export async function checkInstagramPosts() {
-  botLog(`Initiating Instagram check for @${INSTAGRAM_USERNAME}...`);
+export async function checkInstagramPosts(username = INSTAGRAM_USERNAME, channelId = TARGET_CHANNEL_ID) {
+  if (!username) {
+    botLog('No Instagram username configured to check.');
+    return null;
+  }
+  botLog(`Initiating Instagram check for @${username}...`);
   try {
     let post = null;
 
@@ -237,42 +312,42 @@ export async function checkInstagramPosts() {
     }
 
     // Call the API
-    botLog(`Fetching from API: ${API_URL}`);
+    botLog(`Fetching from API: ${API_URL} for @${username}`);
     const response = await axios.get(API_URL, {
-      params: { username: INSTAGRAM_USERNAME },
+      params: { username },
       headers,
       timeout: 10000 // 10 seconds timeout
     });
 
-    post = parseInstagramResponse(response.data);
+    post = parseInstagramResponse(response.data, username);
 
     if (!post) {
-      botLog('Could not extract any posts from API response. Check if structure matches or API is valid.');
+      botLog(`Could not extract any posts from API response for @${username}. Check if structure matches or API is valid.`);
       return null;
     }
 
-    botLog(`Latest post fetched: ID: ${post.id}, Shortcode: ${post.shortcode}`);
+    botLog(`Latest post fetched for @${username}: ID: ${post.id}, Shortcode: ${post.shortcode}`);
     lastCheckedPost = post;
 
-    const savedId = getSavedPostId();
-    botLog(`Stored Post ID is: "${savedId}"`);
+    const savedId = getSavedPostId(username);
+    botLog(`Stored Post ID for @${username} is: "${savedId}"`);
 
     // If it's a brand new post
     if (post.id && post.id !== savedId) {
-      botLog(`New post detected! Storing ID and sending Discord notification.`);
-      savePostId(post.id);
+      botLog(`New post detected for @${username}! Storing ID and sending Discord notification.`);
+      savePostId(username, post.id);
 
       // Send to Discord if bot is ready
-      if (isBotReady && TARGET_CHANNEL_ID && client) {
-        const channel = await client.channels.fetch(TARGET_CHANNEL_ID).catch(err => {
-          botLog(`Failed to fetch target channel ${TARGET_CHANNEL_ID}: ${err.message}`);
+      if (isBotReady && channelId && client) {
+        const channel = await client.channels.fetch(channelId).catch(err => {
+          botLog(`Failed to fetch target channel ${channelId}: ${err.message}`);
           return null;
         });
 
         if (channel && channel.isTextBased()) {
           const embed = new EmbedBuilder()
             .setColor('#E1306C') // Instagram pinkish red
-            .setTitle(`📸 New Post by @${INSTAGRAM_USERNAME}`)
+            .setTitle(`📸 New Post by @${username}`)
             .setURL(post.link)
             .setDescription(post.caption.length > 200 ? `${post.caption.substring(0, 197)}...` : post.caption)
             .setImage(post.mediaUrl || null)
@@ -280,28 +355,28 @@ export async function checkInstagramPosts() {
             .setFooter({ text: 'Instagram Tracker', iconURL: 'https://cdn-icons-png.flaticon.com/512/174/174855.png' });
 
           await channel.send({
-            content: `📢 **Hey everyone! @${INSTAGRAM_USERNAME} just posted on Instagram!**`,
+            content: `📢 **Hey everyone! @${username} just posted on Instagram!**`,
             embeds: [embed]
           });
-          botLog(`Successfully sent Instagram notification embed to channel ${TARGET_CHANNEL_ID}`);
+          botLog(`Successfully sent Instagram notification embed for @${username} to channel ${channelId}`);
         } else {
-          botLog(`Target channel ${TARGET_CHANNEL_ID} is not a valid text channel or is unreachable.`);
+          botLog(`Target channel ${channelId} is not a valid text channel or is unreachable.`);
         }
       } else {
         if (!isBotReady) {
-          botLog('Bot is not logged into Discord; skipped sending message but recorded ID.');
+          botLog(`Bot is not logged into Discord; skipped sending message for @${username} but recorded ID.`);
         }
-        if (!TARGET_CHANNEL_ID) {
-          botLog('TARGET_CHANNEL_ID is not configured; skipped sending Discord message.');
+        if (!channelId) {
+          botLog(`Target channel ID is not configured for @${username}; skipped sending Discord message.`);
         }
       }
     } else {
-      botLog('No new posts detected (matches stored ID).');
+      botLog(`No new posts detected for @${username} (matches stored ID).`);
     }
 
     return post;
   } catch (error) {
-    botLog(`Error checking Instagram posts: ${error.message}`);
+    botLog(`Error checking Instagram posts for @${username}: ${error.message}`);
     if (error.response) {
       botLog(`API response status: ${error.response.status}`);
     }
@@ -333,6 +408,10 @@ async function registerSlashCommands(clientId) {
           .setDescription('The channel to send the embeds to')
           .setRequired(true)
       )
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder()
+      .setName('editupdate')
+      .setDescription('View and delete active Instagram tracking setups.')
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   ].map(command => command.toJSON());
 
@@ -381,9 +460,22 @@ function initDiscordClient(usePrivileged = true) {
     botLog(`SUCCESS! Logged into Discord as ${client.user.tag}`);
 
     // Set customizable presence status (e.g. Watching @username)
-    const presenceString = `Watching @${INSTAGRAM_USERNAME}`;
+    const presenceString = `Watching @${INSTAGRAM_USERNAME || 'multiple accounts'}`;
     client.user.setActivity(presenceString, { type: ActivityType.Watching });
     botLog(`Presence set to: "Watching @${INSTAGRAM_USERNAME}"`);
+
+    // Update bot bio / description
+    try {
+      client.application.edit({
+        description: "Your dedicated social media recon bot. Tracking the timeline so you don't have to. 📡"
+      }).then(() => {
+        botLog('Successfully updated bot application bio/description!');
+      }).catch(err => {
+        botLog(`Could not update bot bio: ${err.message}`);
+      });
+    } catch (err) {
+      botLog(`Failed to update application bio: ${err.message}`);
+    }
 
     // Dynamic Client ID detection for slash command registration
     const detectedClientId = process.env.CLIENT_ID || client.user.id;
@@ -397,21 +489,32 @@ function initDiscordClient(usePrivileged = true) {
     if (!isPollingStarted) {
       isPollingStarted = true;
       
-      const pollIteration = () => {
+      const pollIteration = async () => {
         if (!fs.existsSync(CONFIG_PATH)) {
           console.log('[Bot] config.json does not exist yet. Polling skipped.');
           return;
         }
         try {
-          const configData = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-          if (configData.username) {
-            INSTAGRAM_USERNAME = configData.username;
+          const fileContent = fs.readFileSync(CONFIG_PATH, 'utf8');
+          const targets = JSON.parse(fileContent);
+          
+          if (!Array.isArray(targets) || targets.length === 0) {
+            console.log('[Bot] No Instagram targets found in config.json. Polling skipped.');
+            return;
           }
-          if (configData.channel) {
-            TARGET_CHANNEL_ID = configData.channel;
+
+          botLog(`Polling loop running dynamically for ${targets.length} targets`);
+
+          for (const target of targets) {
+            const username = target.instagramUsername || target.username;
+            const channelId = target.channelId || target.channel;
+            if (username) {
+              botLog(`Triggering poll for target: @${username} (Channel: ${channelId})`);
+              await checkInstagramPosts(username, channelId);
+              // Small delay to prevent API rate limits or spamming if multiple accounts exist
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
           }
-          botLog(`Polling loop running dynamically with username: ${INSTAGRAM_USERNAME}, channel ID: ${TARGET_CHANNEL_ID}`);
-          checkInstagramPosts();
         } catch (err) {
           console.log(`[Bot] Error reading/parsing config.json in polling loop: ${err.message}`);
         }
@@ -456,10 +559,10 @@ function initDiscordClient(usePrivileged = true) {
         const helpEmbed = new EmbedBuilder()
           .setColor('#5865F2') // Discord blurple
           .setTitle('🤖 Instagram Tracker Bot Help')
-          .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME}** and announce new posts automatically.`)
+          .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME || 'multiple accounts'}** and announce new posts automatically.`)
           .addFields(
-            { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})` },
-            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.` },
+            { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME || 'Not set'}](https://instagram.com/${INSTAGRAM_USERNAME || ''})` },
+            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.\n• \`/editupdate\` - View and delete active Instagram tracking setups.` },
             { name: '🎯 Automatic Features', value: `• **Mention Reply:** Tag me anytime to see my prefix.\n• **Instagram Polling:** Automatically queries Instagram every 15 minutes and publishes embeds for new content.` }
           )
           .setFooter({ text: 'Created with discord.js v14', iconURL: client.user.displayAvatarURL() })
@@ -482,7 +585,7 @@ function initDiscordClient(usePrivileged = true) {
           .addFields(
             { name: '📡 Bot Health', value: '🟢 Active & Online', inline: true },
             { name: '⚡ Bot Latency', value: `\`${client.ws.ping}ms\``, inline: true },
-            { name: '📸 Tracking Target', value: `[@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})`, inline: true },
+            { name: '📸 Tracking Target', value: `[@${INSTAGRAM_USERNAME || 'multiple'}](https://instagram.com/${INSTAGRAM_USERNAME || ''})`, inline: true },
             { name: '🕒 Last Fetched Post', value: lastCheckedPost ? `[${lastCheckedPost.shortcode || lastCheckedPost.id}](${lastCheckedPost.link})` : 'None yet' }
           )
           .setTimestamp();
@@ -494,8 +597,61 @@ function initDiscordClient(usePrivileged = true) {
     }
   });
 
-  // Bot Interaction Create event handler (for slash commands)
+  // Bot Interaction Create event handler (for slash commands and components)
   client.on('interactionCreate', async (interaction) => {
+    // Handle Select Menu Selection
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'delete_menu') {
+        botLog(`User ${interaction.user.username} selected an account to delete tracking via select menu`);
+        try {
+          const usernameToDelete = interaction.values[0];
+          
+          let targets = [];
+          if (fs.existsSync(CONFIG_PATH)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+              if (Array.isArray(data)) {
+                targets = data;
+              }
+            } catch (_) {}
+          }
+
+          targets = targets.filter(t => (t.instagramUsername || t.username || '').toLowerCase() !== usernameToDelete.toLowerCase());
+
+          fs.writeFileSync(CONFIG_PATH, JSON.stringify(targets, null, 2), 'utf8');
+          botLog(`Removed tracking target: @${usernameToDelete}. Remaining: ${targets.length}`);
+
+          // Update active single-account variables dynamically
+          if (targets.length > 0) {
+            INSTAGRAM_USERNAME = targets[0].instagramUsername || targets[0].username || '';
+            TARGET_CHANNEL_ID = targets[0].channelId || targets[0].channel || '';
+          } else {
+            INSTAGRAM_USERNAME = '';
+            TARGET_CHANNEL_ID = '';
+          }
+
+          // Update presence dynamically
+          if (client && isBotReady) {
+            const presenceString = `Watching @${INSTAGRAM_USERNAME || 'multiple accounts'}`;
+            client.user.setActivity(presenceString, { type: ActivityType.Watching });
+          }
+
+          await interaction.update({
+            content: `✅ Successfully stopped tracking **@${usernameToDelete}**.`,
+            embeds: [],
+            components: []
+          });
+        } catch (err) {
+          botLog(`Failed to handle delete select menu: ${err.message}`);
+          await interaction.reply({
+            content: `❌ **Failed to delete tracking setup:** ${err.message}`,
+            ephemeral: true
+          }).catch(() => {});
+        }
+      }
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName } = interaction;
@@ -506,10 +662,10 @@ function initDiscordClient(usePrivileged = true) {
         const helpEmbed = new EmbedBuilder()
           .setColor('#5865F2') // Discord blurple
           .setTitle('🤖 Instagram Tracker Bot Help')
-          .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME}** and announce new posts automatically.`)
+          .setDescription(`Hello! I am a production-ready Discord Bot designed to track **@${INSTAGRAM_USERNAME || 'multiple accounts'}** and announce new posts automatically.`)
           .addFields(
-            { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})` },
-            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.` },
+            { name: '📋 Configuration', value: `• **Prefix:** \`${BOT_PREFIX}\`\n• **Target Channel:** <#${TARGET_CHANNEL_ID || 'Not set'}>\n• **Tracking Account:** [@${INSTAGRAM_USERNAME || 'Not set'}](https://instagram.com/${INSTAGRAM_USERNAME || ''})` },
+            { name: '✨ Commands', value: `• \`/help\` or \`${BOT_PREFIX}help\` - Displays this information menu.\n• \`/status\` or \`${BOT_PREFIX}status\` - Check tracking and server parameters.\n• \`/setup\` - Set up Instagram target username and announcement channel.\n• \`/editupdate\` - View and delete active Instagram tracking setups.` },
             { name: '🎯 Automatic Features', value: `• **Mention Reply:** Tag me anytime to see my prefix.\n• **Instagram Polling:** Automatically queries Instagram every 15 minutes and publishes embeds for new content.` }
           )
           .setFooter({ text: 'Created with discord.js v14', iconURL: client.user.displayAvatarURL() })
@@ -531,7 +687,7 @@ function initDiscordClient(usePrivileged = true) {
           .addFields(
             { name: '📡 Bot Health', value: '🟢 Active & Online', inline: true },
             { name: '⚡ Bot Latency', value: `\`${client.ws.ping}ms\``, inline: true },
-            { name: '📸 Tracking Target', value: `[@${INSTAGRAM_USERNAME}](https://instagram.com/${INSTAGRAM_USERNAME})`, inline: true },
+            { name: '📸 Tracking Target', value: `[@${INSTAGRAM_USERNAME || 'multiple'}](https://instagram.com/${INSTAGRAM_USERNAME || ''})`, inline: true },
             { name: '🕒 Last Fetched Post', value: lastCheckedPost ? `[${lastCheckedPost.shortcode || lastCheckedPost.id}](${lastCheckedPost.link})` : 'None yet' }
           )
           .setTimestamp();
@@ -548,13 +704,37 @@ function initDiscordClient(usePrivileged = true) {
         const username = interaction.options.getString('username', true);
         const channel = interaction.options.getChannel('channel', true);
 
-        const configData = {
-          username: username,
-          channel: channel.id
-        };
+        let targets = [];
+        if (fs.existsSync(CONFIG_PATH)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            if (Array.isArray(data)) {
+              targets = data;
+            } else if (data && typeof data === 'object') {
+              const oldUser = data.username || data.instagramUsername;
+              const oldChannel = data.channel || data.channelId;
+              if (oldUser) {
+                targets.push({ instagramUsername: oldUser, channelId: oldChannel || '' });
+              }
+            }
+          } catch (_) {}
+        }
 
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(configData, null, 2), 'utf8');
-        botLog(`Successfully saved new setup configuration to config.json: Target username: ${username}, Target Channel: ${channel.id}`);
+        const isDuplicate = targets.some(t => (t.instagramUsername || t.username || '').toLowerCase() === username.toLowerCase());
+        if (isDuplicate) {
+          return await interaction.reply({
+            content: `⚠️ **Tracking setup already exists for @${username}.**`,
+            ephemeral: true
+          });
+        }
+
+        targets.push({
+          instagramUsername: username,
+          channelId: channel.id
+        });
+
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(targets, null, 2), 'utf8');
+        botLog(`Successfully appended new setup configuration to config.json: Target username: ${username}, Target Channel: ${channel.id}`);
 
         // Update active in-memory variables dynamically
         INSTAGRAM_USERNAME = username;
@@ -575,6 +755,70 @@ function initDiscordClient(usePrivileged = true) {
         botLog(`Failed to execute /setup command: ${err.message}`);
         await interaction.reply({
           content: `❌ **Failed to complete setup:** ${err.message}`,
+          ephemeral: true
+        }).catch(() => {});
+      }
+    }
+
+    if (commandName === 'editupdate') {
+      botLog(`User ${interaction.user.username} executed /editupdate slash command`);
+      try {
+        let targets = [];
+        if (fs.existsSync(CONFIG_PATH)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            if (Array.isArray(data)) {
+              targets = data;
+            }
+          } catch (_) {}
+        }
+
+        if (targets.length === 0) {
+          return await interaction.reply({
+            content: '❌ **No active Instagram tracking setups are configured.**',
+            ephemeral: true
+          });
+        }
+
+        const embed = new EmbedBuilder()
+          .setColor('#5865F2')
+          .setTitle('🗂️ Active Instagram Tracking Setups')
+          .setDescription('Here is a list of all active Instagram accounts being tracked. Use the dropdown menu below to stop tracking any account:')
+          .setTimestamp();
+
+        const fields = targets.map((target, index) => ({
+          name: `${index + 1}. @${target.instagramUsername || target.username}`,
+          value: `Announcement Channel: <#${target.channelId || target.channel}>`,
+          inline: false
+        }));
+
+        embed.addFields(fields);
+
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('delete_menu')
+          .setPlaceholder('Select an Instagram account to delete tracking...')
+          .addOptions(
+            targets.map(target => {
+              const uName = target.instagramUsername || target.username;
+              return {
+                label: `@${uName}`,
+                description: `Stop tracking @${uName}`,
+                value: uName
+              };
+            })
+          );
+
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+
+        await interaction.reply({
+          embeds: [embed],
+          components: [row],
+          ephemeral: true
+        });
+      } catch (err) {
+        botLog(`Failed to execute /editupdate command: ${err.message}`);
+        await interaction.reply({
+          content: `❌ **Failed to retrieve tracking setups:** ${err.message}`,
           ephemeral: true
         }).catch(() => {});
       }
