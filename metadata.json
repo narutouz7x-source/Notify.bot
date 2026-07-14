@@ -1,0 +1,6 @@
+{
+  "name": "Discord Instagram Bot",
+  "description": "A production-ready Discord bot that tracks Instagram posts, responds to mentions, and provides interactive commands, complete with a clean setup and monitoring web interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
